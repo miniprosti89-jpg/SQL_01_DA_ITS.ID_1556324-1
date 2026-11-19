@@ -1,101 +1,118 @@
--- Представление для первой группы (только страновой уровень)
-CREATE VIEW covid.daily_statistics_country_level AS
-WITH country_first AS (
+-- Задание 9. Создание трех представлений (VIEW) для каждой группы наблюдений
+
+-- 1. Представление для первой группы (только страновой уровень)
+CREATE OR REPLACE VIEW covid.daily_statistics_country_level AS
+WITH group1_countries AS (
     SELECT c.id
-    FROM geo_info.countries c
-    JOIN covid.daily_statistics ds ON c.id = ds.country_id
+    FROM geo_info.countries AS c
+    JOIN covid.daily_statistics AS ds ON c.id = ds.country_id
     GROUP BY c.id
     HAVING COUNT(ds.region_id) = 0
 )
 SELECT
-    d.country_id,
-    d.observed_date,
-    d.confirmed - COALESCE(prev.confirmed, 0) AS confirmed_by_day,
-    d.deaths - COALESCE(prev.deaths, 0) AS deaths_by_day
-FROM covid.daily_statistics d
-LEFT JOIN covid.daily_statistics prev ON
-    d.country_id = prev.country_id
-    AND prev.observed_date = (
-        SELECT MAX(observed_date)
-        FROM covid.daily_statistics sub
-        WHERE sub.country_id = d.country_id AND sub.observed_date < d.observed_date
-    )
-WHERE d.country_id IN (SELECT id FROM country_first)
-ORDER BY d.country_id, d.observed_date;
+    cur.country_id,
+    cur.observed_date,
+    cur.confirmed - COALESCE(prev.confirmed, 0) AS confirmed_by_day,
+    cur.deaths - COALESCE(prev.deaths, 0) AS deaths_by_day
+FROM covid.daily_statistics AS cur
+LEFT JOIN covid.daily_statistics AS prev
+    ON cur.country_id = prev.country_id
+   AND cur.observed_date - 1 = prev.observed_date
+WHERE cur.country_id IN (SELECT id FROM group1_countries)
+ORDER BY
+    cur.country_id,
+    cur.observed_date;
 
--- Представление для второй группы (только региональный уровень, агрегировано по стране)
-CREATE VIEW covid.daily_statistics_region_level AS
-WITH country_second AS (
+
+-- 2. Представление для второй группы (только региональный уровень)
+CREATE OR REPLACE VIEW covid.daily_statistics_region_level AS
+WITH group2_countries AS (
     SELECT c.id
-    FROM geo_info.countries c
-    JOIN covid.daily_statistics ds ON c.id = ds.country_id
+    FROM geo_info.countries AS c
+    JOIN covid.daily_statistics AS ds ON c.id = ds.country_id
     GROUP BY c.id
-    HAVING COUNT(ds.region_id) = COUNT(*) AND COUNT(*) > 0
+    HAVING COUNT(ds.region_id) = COUNT(*)
+       AND COUNT(*) > 0
 ),
-country_agg AS (
+daily_country_totals AS (
     SELECT
         country_id,
         observed_date,
-        SUM(confirmed) AS confirmed_sum,
-        SUM(deaths) AS deaths_sum
+        SUM(confirmed) AS confirmed_total,
+        SUM(deaths) AS deaths_total
     FROM covid.daily_statistics
-    WHERE country_id IN (SELECT id FROM country_second)
-    GROUP BY country_id, observed_date
+    WHERE country_id IN (SELECT id FROM group2_countries)
+    GROUP BY
+        country_id,
+        observed_date
 )
 SELECT
-    country_id,
-    observed_date,
-    confirmed_sum - LAG(confirmed_sum, 1, 0) OVER (PARTITION BY country_id ORDER BY observed_date) AS confirmed_by_day,
-    deaths_sum - LAG(deaths_sum, 1, 0) OVER (PARTITION BY country_id ORDER BY observed_date) AS deaths_by_day
-FROM country_agg
-ORDER BY country_id, observed_date;
+    cur.country_id,
+    cur.observed_date,
+    cur.confirmed_total - COALESCE(prev.confirmed_total, 0) AS confirmed_by_day,
+    cur.deaths_total - COALESCE(prev.deaths_total, 0) AS deaths_by_day
+FROM daily_country_totals AS cur
+LEFT JOIN daily_country_totals AS prev
+    ON cur.country_id = prev.country_id
+   AND cur.observed_date - 1 = prev.observed_date
+ORDER BY
+    cur.country_id,
+    cur.observed_date;
 
--- Представление для третьей группы (смешанный тип)
-CREATE VIEW covid.daily_statistics_mix AS
-WITH country_third AS (
-    -- Страны, у которых есть и NULL, и NOT NULL в region_id
+
+-- 3. Представление для третьей группы (смешанный уровень)
+CREATE OR REPLACE VIEW covid.daily_statistics_mix AS
+WITH group3_countries AS (
     SELECT DISTINCT c.id
-    FROM geo_info.countries c
-    JOIN covid.daily_statistics d1 ON c.id = d1.country_id AND d1.region_id IS NULL
-    JOIN covid.daily_statistics d2 ON c.id = d2.country_id AND d2.region_id IS NOT NULL
+    FROM geo_info.countries AS c
+    JOIN covid.daily_statistics AS ds1
+        ON c.id = ds1.country_id AND ds1.region_id IS NULL
+    JOIN covid.daily_statistics AS ds2
+        ON c.id = ds2.country_id AND ds2.region_id IS NOT NULL
 ),
--- Данные на уровне регионов (суммируем по стране и дате)
-region_agg AS (
+regional_summary AS (
     SELECT
         country_id,
         observed_date,
-        SUM(confirmed) AS confirmed_reg,
-        SUM(deaths) AS deaths_reg
+        SUM(confirmed) AS confirmed_val,
+        SUM(deaths) AS deaths_val
     FROM covid.daily_statistics
-    WHERE country_id IN (SELECT id FROM country_third) AND region_id IS NOT NULL
-    GROUP BY country_id, observed_date
+    WHERE country_id IN (SELECT id FROM group3_countries)
+      AND region_id IS NOT NULL
+    GROUP BY
+        country_id,
+        observed_date
 ),
--- Данные на уровне страны (без регионов)
-country_agg_mix AS (
+country_summary AS (
     SELECT
         country_id,
         observed_date,
-        confirmed AS confirmed_cnt,
-        deaths AS deaths_cnt
+        confirmed AS confirmed_val,
+        deaths AS deaths_val
     FROM covid.daily_statistics
-    WHERE country_id IN (SELECT id FROM country_third) AND region_id IS NULL
+    WHERE country_id IN (SELECT id FROM group3_countries)
+      AND region_id IS NULL
 ),
--- Объединяем, отдавая приоритет региональным данным (если есть)
-unified AS (
+unified_totals AS (
     SELECT
         COALESCE(r.country_id, c.country_id) AS country_id,
         COALESCE(r.observed_date, c.observed_date) AS observed_date,
-        COALESCE(r.confirmed_reg, c.confirmed_cnt) AS confirmed_total,
-        COALESCE(r.deaths_reg, c.deaths_cnt) AS deaths_total
-    FROM region_agg r
-    FULL OUTER JOIN country_agg_mix c
-        ON r.country_id = c.country_id AND r.observed_date = c.observed_date
+        COALESCE(r.confirmed_val, c.confirmed_val) AS confirmed_total,
+        COALESCE(r.deaths_val, c.deaths_val) AS deaths_total
+    FROM regional_summary AS r
+    FULL OUTER JOIN country_summary AS c
+        ON r.country_id = c.country_id
+       AND r.observed_date = c.observed_date
 )
--- Вычисляем ежедневные приросты
 SELECT
-    country_id,
-    observed_date,
-    confirmed_total - LAG(confirmed_total, 1, 0) OVER (PARTITION BY country_id ORDER BY observed_date) AS confirmed_by_day,
-    deaths_total - LAG(deaths_total, 1, 0) OVER (PARTITION BY country_id ORDER BY observed_date) AS deaths_by_day
-FROM unified
-ORDER BY country_id, observed_date;
+    cur.country_id,
+    cur.observed_date,
+    cur.confirmed_total - COALESCE(prev.confirmed_total, 0) AS confirmed_by_day,
+    cur.deaths_total - COALESCE(prev.deaths_total, 0) AS deaths_by_day
+FROM unified_totals AS cur
+LEFT JOIN unified_totals AS prev
+    ON cur.country_id = prev.country_id
+   AND cur.observed_date - 1 = prev.observed_date
+ORDER BY
+    cur.country_id,
+    cur.observed_date;
